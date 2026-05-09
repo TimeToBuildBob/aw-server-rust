@@ -199,7 +199,12 @@ mod tests {
         }
     }
 
-    fn rule(bucket_prefix: &str, field: &str, pattern: &str, action: FilterAction) -> PrivacyFilter {
+    fn rule(
+        bucket_prefix: &str,
+        field: &str,
+        pattern: &str,
+        action: FilterAction,
+    ) -> PrivacyFilter {
         PrivacyFilter {
             enabled: true,
             bucket_prefix: bucket_prefix.to_string(),
@@ -253,18 +258,9 @@ mod tests {
 
     #[test]
     fn bucket_prefix_scoping() {
-        let rules = compile(&[rule(
-            "aw-watcher-window",
-            "title",
-            ".*",
-            FilterAction::Drop,
-        )]);
+        let rules = compile(&[rule("aw-watcher-window", "title", ".*", FilterAction::Drop)]);
         // Different bucket prefix, rule should not apply.
-        let kept = apply(
-            &rules,
-            "aw-watcher-afk_test",
-            evt(json!({"status": "afk"})),
-        );
+        let kept = apply(&rules, "aw-watcher-afk_test", evt(json!({"status": "afk"})));
         assert!(kept.is_some());
     }
 

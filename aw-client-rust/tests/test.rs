@@ -118,6 +118,7 @@ mod test {
             datastore: Mutex::new(aw_datastore::Datastore::new_in_memory(false)),
             asset_resolver: AssetResolver::new(None),
             device_id: "test_id".to_string(),
+            privacy_filters: vec![],
         };
         let mut aw_config = aw_server::config::AWConfig::default();
         aw_config.port = port;

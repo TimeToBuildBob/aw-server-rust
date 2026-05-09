@@ -819,8 +819,7 @@ mod api_tests {
             .header(Header::new("Host", "127.0.0.1:5600"))
             .dispatch();
         assert_eq!(res.status(), Status::Ok);
-        let events: Vec<Value> =
-            serde_json::from_str(&res.into_string().unwrap()).unwrap();
+        let events: Vec<Value> = serde_json::from_str(&res.into_string().unwrap()).unwrap();
         assert!(events.is_empty(), "dropped heartbeat must not be stored");
     }
 
@@ -864,17 +863,14 @@ mod api_tests {
             .header(Header::new("Host", "127.0.0.1:5600"))
             .dispatch();
         assert_eq!(res.status(), Status::Ok);
-        let events: Vec<Value> =
-            serde_json::from_str(&res.into_string().unwrap()).unwrap();
+        let events: Vec<Value> = serde_json::from_str(&res.into_string().unwrap()).unwrap();
         assert_eq!(events.len(), 1, "redacted event must be stored");
         assert_eq!(
-            events[0]["data"]["title"],
-            "REDACTED",
+            events[0]["data"]["title"], "REDACTED",
             "sensitive title must be replaced"
         );
         assert_eq!(
-            events[0]["data"]["app"],
-            "1Password",
+            events[0]["data"]["app"], "1Password",
             "non-matching fields must be preserved"
         );
     }
