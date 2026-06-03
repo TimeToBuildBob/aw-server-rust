@@ -704,4 +704,71 @@ mod query_tests {
             num => panic!("Expected number, got {num:?}"),
         };
     }
+
+    #[test]
+    fn test_merge_subwatcher_fields() {
+        let ds = setup_datastore_with_bucket();
+        let interval = TimeInterval::new_from_string(TIME_INTERVAL).unwrap();
+
+        // Insert base window events
+        let base_events = vec![
+            Event {
+                id: None,
+                timestamp: chrono::Utc::now(),
+                duration: Duration::seconds(10),
+                data: json_map! {"app": json!("Firefox")},
+            },
+        ];
+        ds.insert_events(BUCKET_ID, &base_events).unwrap();
+
+        // Insert editor events in a separate bucket
+        let editor_bucket_id = "editor-testid";
+        let editor_bucket = Bucket {
+            bid: None,
+            id: editor_bucket_id.to_string(),
+            _type: "editor".to_string(),
+            client: "testclient".to_string(),
+            hostname: "testhost".to_string(),
+            created: Some(chrono::Utc::now()),
+            data: json_map! {},
+            metadata: BucketMetadata::default(),
+            events: None,
+            last_updated: None,
+        };
+        ds.create_bucket(&editor_bucket).unwrap();
+        let editor_events = vec![
+            Event {
+                id: None,
+                timestamp: chrono::Utc::now(),
+                duration: Duration::seconds(5),
+                data: json_map! {
+                    "project": json!("gptme"),
+                    "file": json!("src/main.rs"),
+                    "language": json!("Rust")
+                }
+            },
+        ];
+        ds.insert_events("editor-testid", &editor_events).unwrap();
+
+        // Query: fetch window events, enrich with editor fields via merge_subwatcher_fields
+        let code = format!(
+            r#"
+            events = query_bucket("{}");
+            editor_events = flood(query_bucket("editor-testid"));
+            editor_events = filter_period_intersect(editor_events, events);
+            events = merge_subwatcher_fields(events, editor_events, ["project", "file"]);
+            return  events;"#,
+            BUCKET_ID
+        );
+        let result: DataType = aw_query::query(&code, &interval, &ds).unwrap();
+        let events: Vec<Event> = Vec::try_from(&result).unwrap();
+        assert_eq!(events.len(), 1);
+        let event = events.first().unwrap();
+        assert_eq!(event.data.get("project").unwrap(), &json!("gptme"));
+        assert_eq!(event.data.get("file").unwrap(), &json!("src/main.rs"));
+        // language was not in keys, should not be present
+        assert!(event.data.get("language").is_none());
+        // original fields are preserved
+        assert_eq!(event.data.get("app").unwrap(), &json!("Firefox"));
+    }
 }
