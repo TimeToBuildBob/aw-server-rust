@@ -54,7 +54,7 @@ pub mod android {
         match DATASTORE {
             Some(ref ds) => ds.clone(),
             None => {
-                let db_dir = dirs::db_path(false)
+                let db_dir = dirs::db_path("default")
                     .expect("Failed to get db path")
                     .to_str()
                     .unwrap()
@@ -125,7 +125,7 @@ pub mod android {
             };
             info!("Using server_state:: device_id: {}", server_state.device_id);
 
-            let mut server_config = crate::config::create_config(false, None);
+            let mut server_config = crate::config::create_config("default", None);
             server_config.port = 5600;
 
             endpoints::build_rocket(server_state, server_config)
