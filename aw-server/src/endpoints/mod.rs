@@ -116,6 +116,7 @@ fn server_info(config: &State<AWConfig>, state: &State<ServerState>) -> Json<Inf
         hostname,
         version: format!("v{} (rust)", VERSION.unwrap_or("(unknown)")),
         testing: config.testing,
+        profile: crate::config::get_profile().to_string(),
         device_id: state.device_id.clone(),
     })
 }
