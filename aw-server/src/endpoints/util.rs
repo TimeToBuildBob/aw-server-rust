@@ -1,7 +1,8 @@
 use std::fs::File;
-use std::io::{copy, pipe, Cursor, PipeReader, PipeWriter, Seek, SeekFrom};
+use std::io::{copy, pipe, Cursor, PipeReader, PipeWriter, Seek, SeekFrom, Write};
 use std::thread;
 
+use chrono::{DateTime, Utc};
 use rocket::http::ContentType;
 use rocket::http::Header;
 use rocket::http::Status;
@@ -152,6 +153,158 @@ impl<'r> Responder<'r, 'static> for BucketsExportRocket {
             .status(Status::Ok)
             .header(Header::new("Content-Disposition", self.filename))
             .header(ContentType::JSON)
+            .streamed_body(rocket::tokio::fs::File::from_std(pipe_reader_to_file(
+                reader,
+            )))
+            .ok()
+    }
+}
+
+// ── CSV streaming export ──────────────────────────────────────────────────────
+
+/// Minimal RFC-4180 CSV field escaper.
+fn csv_escape(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_owned()
+    }
+}
+
+/// Serialize a slice of events as RFC-4180 CSV.
+///
+/// Columns: `id`, `timestamp`, `duration`, then all keys from the first
+/// event's `data` map (same schema the webui uses for client-side CSV).
+fn events_to_csv(events: &[aw_models::Event]) -> String {
+    let data_keys: Vec<String> = events
+        .first()
+        .map(|e| e.data.keys().cloned().collect())
+        .unwrap_or_default();
+
+    let header: Vec<&str> = {
+        let mut h = vec!["id", "timestamp", "duration"];
+        for k in &data_keys {
+            h.push(k.as_str());
+        }
+        h
+    };
+
+    let mut out = header
+        .iter()
+        .map(|s| csv_escape(s))
+        .collect::<Vec<_>>()
+        .join(",");
+    out.push('\n');
+
+    for event in events {
+        let mut fields = vec![
+            event.id.map(|i| i.to_string()).unwrap_or_default(),
+            event.timestamp.to_rfc3339(),
+            // duration is serialized as fractional seconds (same as JSON)
+            format!("{:.9}", event.duration.num_milliseconds() as f64 / 1000.0),
+        ];
+        for key in &data_keys {
+            let val = match event.data.get(key) {
+                Some(serde_json::Value::String(s)) => s.clone(),
+                Some(v) => v.to_string(),
+                None => String::new(),
+            };
+            fields.push(val);
+        }
+        out.push_str(
+            &fields
+                .iter()
+                .map(|s| csv_escape(s))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        out.push('\n');
+    }
+    out
+}
+
+pub struct BucketEventsCsvRocket {
+    datastore: aw_datastore::Datastore,
+    bucket_id: String,
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
+    limit: Option<u64>,
+    filename: String,
+}
+
+impl BucketEventsCsvRocket {
+    pub fn new(
+        datastore: &aw_datastore::Datastore,
+        bucket_id: &str,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: Option<u64>,
+    ) -> Result<Self, HttpErrorJson> {
+        // 404-check the bucket before headers are sent so errors return
+        // a proper JSON body rather than truncating mid-stream.
+        datastore.get_bucket(bucket_id)?;
+        let filename = format!("attachment; filename=aw-events-export-{bucket_id}.csv");
+        Ok(Self {
+            datastore: datastore.clone(),
+            bucket_id: bucket_id.to_owned(),
+            start,
+            end,
+            limit,
+            filename,
+        })
+    }
+}
+
+impl<'r> Responder<'r, 'static> for BucketEventsCsvRocket {
+    fn respond_to(self, _: &Request) -> response::Result<'static> {
+        let Self {
+            datastore,
+            bucket_id,
+            start,
+            end,
+            limit,
+            filename,
+        } = self;
+        let (reader, writer) = pipe().map_err(|err| {
+            error!("Failed to open CSV export pipe: {err}");
+            Status::InternalServerError
+        })?;
+        // Serialize on the datastore worker into a private tempfile, then copy
+        // to the client pipe. Headers are sent immediately; the download starts
+        // before the CSV is fully built.
+        thread::spawn(move || {
+            let events = match datastore.get_events(&bucket_id, start, end, limit) {
+                Ok(e) => e,
+                Err(err) => {
+                    error!("CSV export: get_events failed: {err:?}");
+                    return;
+                }
+            };
+            let csv = events_to_csv(&events);
+            let mut staging = match tempfile::tempfile() {
+                Ok(f) => f,
+                Err(err) => {
+                    error!("Failed to create CSV staging file: {err}");
+                    return;
+                }
+            };
+            if let Err(err) = staging.write_all(csv.as_bytes()) {
+                error!("CSV staging write failed: {err}");
+                return;
+            }
+            if let Err(err) = staging.seek(SeekFrom::Start(0)) {
+                error!("CSV staging rewind failed: {err}");
+                return;
+            }
+            let mut writer = pipe_writer_to_file(writer);
+            if let Err(err) = copy(&mut staging, &mut writer) {
+                error!("CSV export copy failed: {err}");
+            }
+        });
+        Response::build()
+            .status(Status::Ok)
+            .header(Header::new("Content-Disposition", filename))
+            .header(ContentType::new("text", "csv"))
             .streamed_body(rocket::tokio::fs::File::from_std(pipe_reader_to_file(
                 reader,
             )))
