@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{pipe, Cursor, PipeReader, PipeWriter};
+use std::io::{copy, pipe, Cursor, PipeReader, PipeWriter, Seek, SeekFrom};
 use std::thread;
 
 use rocket::http::ContentType;
@@ -90,6 +90,40 @@ fn pipe_writer_to_file(writer: PipeWriter) -> File {
     }
 }
 
+/// Serialize on the datastore worker into a private tempfile, then copy to
+/// the client pipe from this thread. The worker stays disk-paced; a slow
+/// or dropped download must not stall heartbeats (see `ServerState`).
+fn spawn_export_stream(
+    datastore: aw_datastore::Datastore,
+    bucket_id: Option<String>,
+    writer: PipeWriter,
+) {
+    thread::spawn(move || {
+        let staging = match tempfile::tempfile() {
+            Ok(file) => file,
+            Err(err) => {
+                error!("Failed to create export staging file: {err}");
+                return;
+            }
+        };
+        let mut staging = match datastore.export_to_file(bucket_id.as_deref(), staging) {
+            Ok((file, _)) => file,
+            Err(err) => {
+                error!("Export stream failed: {err:?}");
+                return;
+            }
+        };
+        if let Err(err) = staging.seek(SeekFrom::Start(0)) {
+            error!("Failed to rewind export staging file: {err}");
+            return;
+        }
+        let mut writer = pipe_writer_to_file(writer);
+        if let Err(err) = copy(&mut staging, &mut writer) {
+            error!("Export stream copy failed: {err}");
+        }
+    });
+}
+
 impl BucketsExportRocket {
     pub fn new(
         datastore: &aw_datastore::Datastore,
@@ -113,15 +147,7 @@ impl<'r> Responder<'r, 'static> for BucketsExportRocket {
             error!("Failed to open export pipe: {err}");
             Status::InternalServerError
         })?;
-        let datastore = self.datastore;
-        let bucket_id = self.bucket_id;
-        thread::spawn(move || {
-            if let Err(err) =
-                datastore.export_to_file(bucket_id.as_deref(), pipe_writer_to_file(writer))
-            {
-                error!("Export stream failed: {err:?}");
-            }
-        });
+        spawn_export_stream(self.datastore, self.bucket_id, writer);
         Response::build()
             .status(Status::Ok)
             .header(Header::new("Content-Disposition", self.filename))

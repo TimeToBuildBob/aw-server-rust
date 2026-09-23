@@ -90,6 +90,54 @@ mod api_tests {
     }
 
     #[test]
+    fn unread_export_body_does_not_block_datastore() {
+        let server = setup_testserver();
+        let datastore = server
+            .state::<endpoints::ServerState>()
+            .unwrap()
+            .datastore
+            .clone();
+        let bucket: Bucket = serde_json::from_value(json!({
+            "id": "big", "type": "test", "client": "test", "hostname": "test"
+        }))
+        .unwrap();
+        datastore.create_bucket(&bucket).unwrap();
+        let mut event = aw_models::Event::default();
+        event
+            .data
+            .insert("blob".into(), json!("x".repeat(128 * 1024)));
+        datastore.insert_events("big", &[event]).unwrap();
+
+        let client = Client::untracked(server).unwrap();
+        let response = client
+            .get("/api/0/buckets/big/export")
+            .header(Header::new("Host", "127.0.0.1:5600"))
+            .dispatch();
+        assert_eq!(response.status(), Status::Ok);
+
+        // Let Command::Export start. A client-paced pipe would fill here and
+        // stall the worker; staging to a tempfile must not.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ds = datastore.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(ds.get_buckets());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(3))
+            .expect("datastore worker blocked by unread export body")
+            .unwrap();
+
+        let body: Value = serde_json::from_str(&response.into_string().unwrap()).unwrap();
+        assert_eq!(
+            body["buckets"]["big"]["events"][0]["data"]["blob"]
+                .as_str()
+                .unwrap()
+                .len(),
+            128 * 1024
+        );
+    }
+
+    #[test]
     fn test_bucket() {
         let server = setup_testserver();
         let client = Client::untracked(server).expect("valid instance");
