@@ -72,6 +72,24 @@ mod api_tests {
     }
 
     #[test]
+    fn export_all_empty_uses_plural_filename_and_opens_before_body() {
+        let server = setup_testserver();
+        let client = Client::untracked(server).unwrap();
+        let response = client
+            .get("/api/0/export")
+            .header(Header::new("Host", "127.0.0.1:5600"))
+            .dispatch();
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(response.content_type(), Some(ContentType::JSON));
+        assert_eq!(
+            response.headers().get_one("Content-Disposition"),
+            Some("attachment; filename=aw-buckets-export.json")
+        );
+        let body: Value = serde_json::from_str(&response.into_string().unwrap()).unwrap();
+        assert_eq!(body["buckets"], json!({}));
+    }
+
+    #[test]
     fn test_bucket() {
         let server = setup_testserver();
         let client = Client::untracked(server).expect("valid instance");
