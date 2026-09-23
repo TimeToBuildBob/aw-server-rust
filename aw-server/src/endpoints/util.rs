@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{copy, pipe, Cursor, PipeReader, PipeWriter, Seek, SeekFrom, Write};
+use std::io::{copy, pipe, Cursor, PipeReader, PipeWriter, Seek, SeekFrom};
 use std::thread;
 
 use chrono::{DateTime, Utc};
@@ -162,65 +162,42 @@ impl<'r> Responder<'r, 'static> for BucketsExportRocket {
 
 // ── CSV streaming export ──────────────────────────────────────────────────────
 
-/// Minimal RFC-4180 CSV field escaper.
-fn csv_escape(s: &str) -> String {
-    if s.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", s.replace('"', "\"\""))
-    } else {
-        s.to_owned()
-    }
-}
-
-/// Serialize a slice of events as RFC-4180 CSV.
-///
-/// Columns: `id`, `timestamp`, `duration`, then all keys from the first
-/// event's `data` map (same schema the webui uses for client-side CSV).
-fn events_to_csv(events: &[aw_models::Event]) -> String {
-    let data_keys: Vec<String> = events
-        .first()
-        .map(|e| e.data.keys().cloned().collect())
-        .unwrap_or_default();
-
-    let header: Vec<&str> = {
-        let mut h = vec!["id", "timestamp", "duration"];
-        for k in &data_keys {
-            h.push(k.as_str());
-        }
-        h
-    };
-
-    let mut out = header
-        .iter()
-        .map(|s| csv_escape(s))
-        .collect::<Vec<_>>()
-        .join(",");
-    out.push('\n');
-
-    for event in events {
-        let mut fields = vec![
-            event.id.map(|i| i.to_string()).unwrap_or_default(),
-            event.timestamp.to_rfc3339(),
-            // duration is serialized as fractional seconds (same as JSON)
-            format!("{:.9}", event.duration.num_milliseconds() as f64 / 1000.0),
-        ];
-        for key in &data_keys {
-            let val = match event.data.get(key) {
-                Some(serde_json::Value::String(s)) => s.clone(),
-                Some(v) => v.to_string(),
-                None => String::new(),
+fn spawn_csv_export_stream(
+    datastore: aw_datastore::Datastore,
+    bucket_id: String,
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
+    limit: Option<u64>,
+    writer: PipeWriter,
+) {
+    thread::spawn(move || {
+        let staging = match tempfile::tempfile() {
+            Ok(file) => file,
+            Err(err) => {
+                error!("Failed to create CSV staging file: {err}");
+                return;
+            }
+        };
+        // Worker writes CSV rows incrementally from SQL (no full event Vec
+        // and no second full-size String). Same tempfile-then-copy pattern
+        // as JSON export: a slow download must not stall heartbeats.
+        let mut staging =
+            match datastore.export_events_csv_to_file(&bucket_id, start, end, limit, staging) {
+                Ok(file) => file,
+                Err(err) => {
+                    error!("CSV export stream failed: {err:?}");
+                    return;
+                }
             };
-            fields.push(val);
+        if let Err(err) = staging.seek(SeekFrom::Start(0)) {
+            error!("CSV staging rewind failed: {err}");
+            return;
         }
-        out.push_str(
-            &fields
-                .iter()
-                .map(|s| csv_escape(s))
-                .collect::<Vec<_>>()
-                .join(","),
-        );
-        out.push('\n');
-    }
-    out
+        let mut writer = pipe_writer_to_file(writer);
+        if let Err(err) = copy(&mut staging, &mut writer) {
+            error!("CSV export copy failed: {err}");
+        }
+    });
 }
 
 pub struct BucketEventsCsvRocket {
@@ -240,9 +217,15 @@ impl BucketEventsCsvRocket {
         end: Option<DateTime<Utc>>,
         limit: Option<u64>,
     ) -> Result<Self, HttpErrorJson> {
-        // 404-check the bucket before headers are sent so errors return
-        // a proper JSON body rather than truncating mid-stream.
+        // Resolve 404/500 before headers commit. get_bucket catches a missing
+        // bucket; LIMIT 1 forces the same SQL the full export will run so a
+        // down worker or a prepare/read failure still returns JSON instead of
+        // a 200 with an empty CSV. Mid-stream failures after 200 cannot change
+        // the status without delaying headers until serialization finishes —
+        // that hung-connection behavior is what this endpoint exists to avoid
+        // (same tradeoff as JSON export / #721).
         datastore.get_bucket(bucket_id)?;
+        datastore.get_events(bucket_id, start, end, Some(1))?;
         let filename = format!("attachment; filename=aw-events-export-{bucket_id}.csv");
         Ok(Self {
             datastore: datastore.clone(),
@@ -269,38 +252,7 @@ impl<'r> Responder<'r, 'static> for BucketEventsCsvRocket {
             error!("Failed to open CSV export pipe: {err}");
             Status::InternalServerError
         })?;
-        // Serialize on the datastore worker into a private tempfile, then copy
-        // to the client pipe. Headers are sent immediately; the download starts
-        // before the CSV is fully built.
-        thread::spawn(move || {
-            let events = match datastore.get_events(&bucket_id, start, end, limit) {
-                Ok(e) => e,
-                Err(err) => {
-                    error!("CSV export: get_events failed: {err:?}");
-                    return;
-                }
-            };
-            let csv = events_to_csv(&events);
-            let mut staging = match tempfile::tempfile() {
-                Ok(f) => f,
-                Err(err) => {
-                    error!("Failed to create CSV staging file: {err}");
-                    return;
-                }
-            };
-            if let Err(err) = staging.write_all(csv.as_bytes()) {
-                error!("CSV staging write failed: {err}");
-                return;
-            }
-            if let Err(err) = staging.seek(SeekFrom::Start(0)) {
-                error!("CSV staging rewind failed: {err}");
-                return;
-            }
-            let mut writer = pipe_writer_to_file(writer);
-            if let Err(err) = copy(&mut staging, &mut writer) {
-                error!("CSV export copy failed: {err}");
-            }
-        });
+        spawn_csv_export_stream(datastore, bucket_id, start, end, limit, writer);
         Response::build()
             .status(Status::Ok)
             .header(Header::new("Content-Disposition", filename))

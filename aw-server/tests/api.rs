@@ -150,11 +150,15 @@ mod api_tests {
         }))
         .unwrap();
         datastore.create_bucket(&bucket).unwrap();
-        let mut event = aw_models::Event::default();
+        let mut event = aw_models::Event {
+            duration: chrono::Duration::nanoseconds(1_500_000),
+            ..Default::default()
+        };
         event.data.insert("app".into(), json!("firefox"));
         event
             .data
             .insert("title".into(), json!("A \"quoted\" title"));
+        event.data.insert("formula".into(), json!("=cmd|calc"));
         let inserted = datastore.insert_events("testbucket", &[event]).unwrap();
 
         let client = Client::untracked(server).unwrap();
@@ -179,6 +183,10 @@ mod api_tests {
             body.contains("\"A \"\"quoted\"\" title\""),
             "quoting: {body}"
         );
+        // Sub-millisecond duration is not truncated to 0.001000000
+        assert!(body.contains("0.001500000"), "duration: {body}");
+        // Spreadsheet formula prefixes are neutralized
+        assert!(body.contains("'=cmd|calc"), "formula: {body}");
         // Event id present
         let event_id = inserted[0].id.unwrap().to_string();
         assert!(body.contains(&event_id), "id in body: {body}");
