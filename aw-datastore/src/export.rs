@@ -206,6 +206,29 @@ fn write_csv_event(
     write_csv_record(writer, fields)
 }
 
+/// Write an already-fetched event slice as RFC-4180 CSV.
+///
+/// Unlike `write_events_csv`, this does not need a database connection —
+/// call it from a background thread after fetching events via `get_events`
+/// so the datastore worker is free during the (potentially long) serialization.
+///
+/// Columns: `id`, `timestamp`, `duration`, then all keys from the first
+/// event's data map.
+pub fn write_csv_from_events(
+    events: &[aw_models::Event],
+    mut writer: impl Write,
+) -> Result<(), DatastoreError> {
+    let data_keys: Vec<String> = events
+        .first()
+        .map(|e| e.data.keys().cloned().collect())
+        .unwrap_or_default();
+    write_csv_header(&mut writer, &data_keys)?;
+    for event in events {
+        write_csv_event(&mut writer, event, &data_keys)?;
+    }
+    Ok(())
+}
+
 /// Stream events for one bucket as RFC-4180 CSV, writing one row at a time.
 ///
 /// Columns: `id`, `timestamp`, `duration`, then all keys from the first

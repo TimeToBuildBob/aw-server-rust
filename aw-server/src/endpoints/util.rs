@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{copy, pipe, Cursor, PipeReader, PipeWriter, Seek, SeekFrom};
+use std::io::{copy, pipe, BufWriter, Cursor, PipeReader, PipeWriter, Seek, SeekFrom};
 use std::thread;
 
 use chrono::{DateTime, Utc};
@@ -171,24 +171,28 @@ fn spawn_csv_export_stream(
     writer: PipeWriter,
 ) {
     thread::spawn(move || {
-        let staging = match tempfile::tempfile() {
+        // Fetch events via the worker. The worker holds the DB lock only for
+        // this SQL read, then is immediately free for heartbeats and other
+        // requests while CSV serialization runs here, off-worker.
+        let events = match datastore.get_events(&bucket_id, start, end, limit) {
+            Ok(events) => events,
+            Err(err) => {
+                error!("CSV export stream failed fetching events: {err:?}");
+                return;
+            }
+        };
+        let mut staging = match tempfile::tempfile() {
             Ok(file) => file,
             Err(err) => {
                 error!("Failed to create CSV staging file: {err}");
                 return;
             }
         };
-        // Worker writes CSV rows incrementally from SQL (no full event Vec
-        // and no second full-size String). Same tempfile-then-copy pattern
-        // as JSON export: a slow download must not stall heartbeats.
-        let mut staging =
-            match datastore.export_events_csv_to_file(&bucket_id, start, end, limit, staging) {
-                Ok(file) => file,
-                Err(err) => {
-                    error!("CSV export stream failed: {err:?}");
-                    return;
-                }
-            };
+        if let Err(err) = aw_datastore::write_csv_from_events(&events, BufWriter::new(&mut staging))
+        {
+            error!("CSV export serialization failed: {err:?}");
+            return;
+        }
         if let Err(err) = staging.seek(SeekFrom::Start(0)) {
             error!("CSV staging rewind failed: {err}");
             return;

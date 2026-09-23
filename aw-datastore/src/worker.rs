@@ -123,13 +123,6 @@ pub enum Response {
 #[derive(Debug)]
 pub enum Command {
     Export(Option<String>, File),
-    ExportEventsCsv(
-        String,
-        Option<DateTime<Utc>>,
-        Option<DateTime<Utc>>,
-        Option<u64>,
-        File,
-    ),
     CreateBucket(Bucket),
     DeleteBucket(String),
     GetBucket(String),
@@ -420,15 +413,6 @@ impl DatastoreWorker {
                 drop(writer);
                 Ok(Response::Export(file, name))
             }
-            Command::ExportEventsCsv(bucket_id, start, end, limit, mut file) => {
-                let mut writer = BufWriter::new(&mut file);
-                ds.write_events_csv(tx, &bucket_id, start, end, limit, &mut writer)?;
-                writer.flush().map_err(|err| {
-                    DatastoreError::InternalError(format!("Failed to flush CSV export: {err}"))
-                })?;
-                drop(writer);
-                Ok(Response::Export(file, Some(bucket_id)))
-            }
             Command::CreateBucket(bucket) => match ds.create_bucket(tx, bucket) {
                 Ok(_) => {
                     self.commit = true;
@@ -716,26 +700,6 @@ impl Datastore {
     /// Same snapshot rules as [`Datastore::export_to_file`]: the worker writes
     /// including uncommitted events, and the file is returned only after
     /// serialization and flush succeed.
-    pub fn export_events_csv_to_file(
-        &self,
-        bucket_id: &str,
-        starttime_opt: Option<DateTime<Utc>>,
-        endtime_opt: Option<DateTime<Utc>>,
-        limit_opt: Option<u64>,
-        file: File,
-    ) -> Result<File, DatastoreError> {
-        match self.request(Command::ExportEventsCsv(
-            bucket_id.to_string(),
-            starttime_opt,
-            endtime_opt,
-            limit_opt,
-            file,
-        ))? {
-            Response::Export(file, _) => Ok(file),
-            _ => panic!("Invalid response"),
-        }
-    }
-
     pub fn insert_events(
         &self,
         bucket_id: &str,
