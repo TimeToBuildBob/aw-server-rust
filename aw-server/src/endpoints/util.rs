@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{copy, pipe, BufWriter, Cursor, PipeReader, PipeWriter, Seek, SeekFrom};
+use std::io::{copy, pipe, BufWriter, Cursor, PipeReader, PipeWriter, Seek, SeekFrom, Write};
 use std::thread;
 
 use chrono::{DateTime, Utc};
@@ -188,10 +188,18 @@ fn spawn_csv_export_stream(
                 return;
             }
         };
-        if let Err(err) = aw_datastore::write_csv_from_events(&events, BufWriter::new(&mut staging))
         {
-            error!("CSV export serialization failed: {err:?}");
-            return;
+            let mut csv_writer = BufWriter::new(&mut staging);
+            if let Err(err) = aw_datastore::write_csv_from_events(&events, &mut csv_writer) {
+                error!("CSV export serialization failed: {err:?}");
+                return;
+            }
+            // BufWriter::drop swallows flush errors. Detect a full staging
+            // filesystem (or similar) before we rewind and copy a truncated CSV.
+            if let Err(err) = csv_writer.flush() {
+                error!("CSV export flush failed: {err}");
+                return;
+            }
         }
         if let Err(err) = staging.seek(SeekFrom::Start(0)) {
             error!("CSV staging rewind failed: {err}");

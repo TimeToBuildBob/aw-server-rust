@@ -226,7 +226,7 @@ pub fn write_csv_from_events(
     for event in events {
         write_csv_event(&mut writer, event, &data_keys)?;
     }
-    Ok(())
+    writer.flush().map_err(csv_io_err)
 }
 
 /// Stream events for one bucket as RFC-4180 CSV, writing one row at a time.
@@ -258,7 +258,8 @@ pub(crate) fn write_events_csv(
     };
     if starttime_filter_ns > endtime_filter_ns {
         warn!("Starttime in event query was lower than endtime!");
-        return write_csv_header(&mut writer, &[]);
+        write_csv_header(&mut writer, &[])?;
+        return writer.flush().map_err(csv_io_err);
     }
     let limit = match limit_opt {
         Some(l) => l as i64,
@@ -312,7 +313,7 @@ pub(crate) fn write_events_csv(
     if data_keys.is_none() {
         write_csv_header(&mut writer, &[])?;
     }
-    Ok(())
+    writer.flush().map_err(csv_io_err)
 }
 
 #[cfg(test)]
@@ -433,6 +434,31 @@ mod tests {
             "\"A \"\"quoted\"\" title\""
         );
         assert_eq!(csv_escape("=1,2"), "\"'=1,2\"");
+    }
+
+    #[test]
+    fn csv_flush_errors_propagate() {
+        struct FlushFailingWriter;
+        impl Write for FlushFailingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "disk full",
+                ))
+            }
+        }
+        let event = Event::new(
+            DateTime::from_timestamp(0, 0).unwrap(),
+            Duration::nanoseconds(1_500_000),
+            serde_json::from_value(serde_json::json!({"app": "firefox"})).unwrap(),
+        );
+        assert!(matches!(
+            write_csv_from_events(&[event], FlushFailingWriter),
+            Err(DatastoreError::InternalError(msg)) if msg.contains("disk full")
+        ));
     }
 
     #[test]
