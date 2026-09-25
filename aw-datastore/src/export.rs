@@ -195,7 +195,8 @@ fn write_csv_record(
             .write_all(csv_escape(&field).as_bytes())
             .map_err(csv_io_err)?;
     }
-    writer.write_all(b"\n").map_err(csv_io_err)
+    // RFC-4180 puts each record on its own line delimited by CRLF.
+    writer.write_all(b"\r\n").map_err(csv_io_err)
 }
 
 /// Maximum number of `data` keys exported as individual CSV columns.
@@ -563,6 +564,25 @@ mod tests {
         // No keys are dropped: every event's data object survives as JSON.
         assert!(csv.contains("k0"), "first key lost: {csv}");
         assert!(csv.contains("k32"), "last key lost: {csv}");
+    }
+
+    #[test]
+    fn streamed_csv_terminates_every_record_with_crlf() {
+        let (conn, mut ds) = setup();
+        let event = Event::new(
+            DateTime::from_timestamp(0, 0).unwrap(),
+            Duration::seconds(1),
+            serde_json::from_value(serde_json::json!({"app": "firefox"})).unwrap(),
+        );
+        ds.insert_events(&conn, "empty", vec![event]).unwrap();
+
+        let mut output = Vec::new();
+        ds.write_events_csv(&conn, "empty", None, None, None, &mut output)
+            .unwrap();
+        let csv = String::from_utf8(output).unwrap();
+        // RFC-4180: header + one event row, each CRLF-terminated.
+        assert!(csv.ends_with("\r\n"), "{csv:?}");
+        assert_eq!(csv.matches("\r\n").count(), 2, "{csv:?}");
     }
 
     #[test]
