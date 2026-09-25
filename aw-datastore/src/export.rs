@@ -161,16 +161,33 @@ fn csv_escape(s: &str) -> String {
 /// `num_nanoseconds()`, which returns `None` (and would export a silent
 /// `0.000000000`) for magnitudes outside the `i64` nanosecond range.
 fn duration_csv(duration: &chrono::Duration) -> String {
-    let sign = if *duration < chrono::Duration::zero() {
-        "-"
+    // chrono stores a negative duration as a negative whole-second part plus a
+    // non-negative subsecond remainder: -1.5s is secs=-2, nanos=500_000_000.
+    // The sign therefore has to be taken off before splitting into seconds and
+    // nanos — `num_seconds()` alone reports -2 for -1.5s, and pairing it with
+    // the remainder would render "-2.500000000". `duration` comes from
+    // `Duration::nanoseconds(endtime - starttime)`, so negating cannot overflow.
+    let (sign, magnitude) = if *duration < chrono::Duration::zero() {
+        ("-", -*duration)
     } else {
-        ""
+        ("", *duration)
     };
     format!(
         "{sign}{}.{:09}",
-        duration.num_seconds().unsigned_abs(),
-        duration.subsec_nanos().unsigned_abs()
+        magnitude.num_seconds(),
+        magnitude.subsec_nanos()
     )
+}
+
+/// SQLite binds `LIMIT` as a signed 64-bit integer, and a negative limit means
+/// "unbounded". Converting a `u64` limit with `as` would wrap values above
+/// `i64::MAX` to a negative number, turning the client's cap into an unbounded
+/// export; saturate instead.
+fn sql_limit(limit_opt: Option<u64>) -> i64 {
+    match limit_opt {
+        Some(l) => i64::try_from(l).unwrap_or(i64::MAX),
+        None => -1,
+    }
 }
 
 fn event_field_value(event: &Event, key: &str) -> String {
@@ -283,10 +300,7 @@ pub(crate) fn write_events_csv(
         write_csv_header(&mut writer, &[])?;
         return writer.flush().map_err(csv_io_err);
     }
-    let limit = match limit_opt {
-        Some(l) => l as i64,
-        None => -1,
-    };
+    let limit = sql_limit(limit_opt);
 
     let sql = if prefer_endtime_index(bucket, starttime_filter_ns, endtime_filter_ns, limit_opt) {
         "SELECT id, starttime, endtime, data
@@ -487,6 +501,30 @@ mod tests {
         );
         assert_eq!(duration_csv(&Duration::milliseconds(1)), "0.001000000");
         assert_eq!(duration_csv(&Duration::seconds(0)), "0.000000000");
+    }
+
+    #[test]
+    fn csv_duration_handles_negative_durations() {
+        // -1.5s is stored by chrono as secs=-2, nanos=500_000_000; taking the
+        // magnitude before splitting is what keeps this at -1.5 and not -2.5.
+        assert_eq!(
+            duration_csv(&Duration::milliseconds(-1_500)),
+            "-1.500000000"
+        );
+        assert_eq!(
+            duration_csv(&Duration::nanoseconds(-1_500_000)),
+            "-0.001500000"
+        );
+        assert_eq!(duration_csv(&Duration::seconds(-1)), "-1.000000000");
+    }
+
+    #[test]
+    fn csv_limit_saturates_instead_of_wrapping() {
+        assert_eq!(sql_limit(None), -1);
+        assert_eq!(sql_limit(Some(10)), 10);
+        assert_eq!(sql_limit(Some(i64::MAX as u64)), i64::MAX);
+        // Would have wrapped to -1 (SQLite: "no limit") under `as`.
+        assert_eq!(sql_limit(Some(u64::MAX)), i64::MAX);
     }
 
     #[test]

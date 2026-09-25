@@ -197,20 +197,15 @@ fn spawn_csv_export_stream(
     start: Option<DateTime<Utc>>,
     end: Option<DateTime<Utc>>,
     limit: Option<u64>,
+    staging: File,
     writer: PipeWriter,
 ) {
     thread::spawn(move || {
-        let staging = match tempfile::tempfile() {
-            Ok(file) => file,
-            Err(err) => {
-                error!("Failed to create CSV staging file: {err}");
-                return;
-            }
-        };
         // Serialize on the datastore worker, one SQL row at a time, into the
-        // staging file. The full event set is never materialized in memory,
-        // and a flush failure (e.g. full staging filesystem) surfaces as an
-        // error instead of a silently truncated CSV.
+        // staging file (created during preflight, before the 200 was
+        // committed). The full event set is never materialized in memory, and
+        // a flush failure (e.g. full staging filesystem) surfaces as an error
+        // instead of a silently truncated CSV.
         let mut staging = match datastore.export_csv_to_file(&bucket_id, start, end, limit, staging)
         {
             Ok(file) => file,
@@ -237,6 +232,7 @@ pub struct BucketEventsCsvRocket {
     end: Option<DateTime<Utc>>,
     limit: Option<u64>,
     filename: String,
+    staging: File,
 }
 
 impl BucketEventsCsvRocket {
@@ -250,12 +246,20 @@ impl BucketEventsCsvRocket {
         // Resolve 404/500 before headers commit. get_bucket catches a missing
         // bucket; LIMIT 1 forces the same SQL the full export will run so a
         // down worker or a prepare/read failure still returns JSON instead of
-        // a 200 with an empty CSV. Mid-stream failures after 200 cannot change
-        // the status without delaying headers until serialization finishes —
-        // that hung-connection behavior is what this endpoint exists to avoid
-        // (same tradeoff as JSON export / #721).
+        // a 200 with an empty CSV. The staging file is also created here: a
+        // full staging filesystem is still reportable as JSON at this point.
+        // Mid-stream failures after 200 cannot change the status without
+        // delaying headers until serialization finishes — that hung-connection
+        // behavior is what this endpoint exists to avoid (same tradeoff as
+        // JSON export / #721).
         datastore.get_bucket(bucket_id)?;
         datastore.get_events(bucket_id, start, end, Some(1))?;
+        let staging = tempfile::tempfile().map_err(|err| {
+            HttpErrorJson::new(
+                Status::InternalServerError,
+                format!("Failed to create CSV staging file: {err}"),
+            )
+        })?;
         let filename = content_disposition(&format!("aw-events-export-{bucket_id}.csv"));
         Ok(Self {
             datastore: datastore.clone(),
@@ -264,6 +268,7 @@ impl BucketEventsCsvRocket {
             end,
             limit,
             filename,
+            staging,
         })
     }
 }
@@ -277,12 +282,13 @@ impl<'r> Responder<'r, 'static> for BucketEventsCsvRocket {
             end,
             limit,
             filename,
+            staging,
         } = self;
         let (reader, writer) = pipe().map_err(|err| {
             error!("Failed to open CSV export pipe: {err}");
             Status::InternalServerError
         })?;
-        spawn_csv_export_stream(datastore, bucket_id, start, end, limit, writer);
+        spawn_csv_export_stream(datastore, bucket_id, start, end, limit, staging, writer);
         Response::build()
             .status(Status::Ok)
             .header(Header::new("Content-Disposition", filename))
