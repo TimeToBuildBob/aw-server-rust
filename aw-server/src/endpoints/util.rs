@@ -62,6 +62,19 @@ fn sanitize_header_value(value: &str) -> String {
         .collect()
 }
 
+/// Build a `Content-Disposition` value for an attachment download.
+///
+/// The filename is quoted: bucket ids may legally contain spaces, and an
+/// unquoted `filename=my bucket.csv` is a malformed parameter that clients may
+/// drop. [`sanitize_header_value`] has already removed the characters that could
+/// break out of the quoted string.
+fn content_disposition(filename: &str) -> String {
+    format!(
+        "attachment; filename=\"{}\"",
+        sanitize_header_value(filename)
+    )
+}
+
 fn export_filename(
     datastore: &aw_datastore::Datastore,
     bucket_id: Option<&str>,
@@ -77,11 +90,8 @@ fn export_filename(
         }
     };
     Ok(match name {
-        Some(id) => format!(
-            "attachment; filename=aw-bucket-export_{}.json",
-            sanitize_header_value(&id)
-        ),
-        None => "attachment; filename=aw-buckets-export.json".into(),
+        Some(id) => content_disposition(&format!("aw-bucket-export_{id}.json")),
+        None => content_disposition("aw-buckets-export.json"),
     })
 }
 
@@ -246,10 +256,7 @@ impl BucketEventsCsvRocket {
         // (same tradeoff as JSON export / #721).
         datastore.get_bucket(bucket_id)?;
         datastore.get_events(bucket_id, start, end, Some(1))?;
-        let filename = format!(
-            "attachment; filename=aw-events-export-{}.csv",
-            sanitize_header_value(bucket_id)
-        );
+        let filename = content_disposition(&format!("aw-events-export-{bucket_id}.csv"));
         Ok(Self {
             datastore: datastore.clone(),
             bucket_id: bucket_id.to_owned(),
@@ -324,7 +331,21 @@ impl From<DatastoreError> for HttpErrorJson {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_header_value;
+    use super::{content_disposition, sanitize_header_value};
+
+    #[test]
+    fn content_disposition_quotes_the_filename() {
+        // Spaces are legal in bucket ids; an unquoted filename= parameter with a
+        // space is malformed and clients may drop it.
+        assert_eq!(
+            content_disposition("aw-events-export-my bucket.csv"),
+            "attachment; filename=\"aw-events-export-my bucket.csv\""
+        );
+        assert_eq!(
+            content_disposition("aw-buckets-export.json"),
+            "attachment; filename=\"aw-buckets-export.json\""
+        );
+    }
 
     #[test]
     fn sanitize_header_value_strips_header_metacharacters() {

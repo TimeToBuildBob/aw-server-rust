@@ -54,7 +54,7 @@ mod api_tests {
             assert_eq!(response.content_type(), Some(ContentType::JSON));
             assert_eq!(
                 response.headers().get_one("Content-Disposition"),
-                Some("attachment; filename=aw-bucket-export_live.json")
+                Some("attachment; filename=\"aw-bucket-export_live.json\"")
             );
             let body: Value = serde_json::from_str(&response.into_string().unwrap()).unwrap();
             assert_eq!(
@@ -83,7 +83,7 @@ mod api_tests {
         assert_eq!(response.content_type(), Some(ContentType::JSON));
         assert_eq!(
             response.headers().get_one("Content-Disposition"),
-            Some("attachment; filename=aw-buckets-export.json")
+            Some("attachment; filename=\"aw-buckets-export.json\"")
         );
         let body: Value = serde_json::from_str(&response.into_string().unwrap()).unwrap();
         assert_eq!(body["buckets"], json!({}));
@@ -173,7 +173,7 @@ mod api_tests {
         );
         assert_eq!(
             response.headers().get_one("Content-Disposition"),
-            Some("attachment; filename=aw-events-export-testbucket.csv")
+            Some("attachment; filename=\"aw-events-export-testbucket.csv\"")
         );
         let body = response.into_string().unwrap();
         // Header row
