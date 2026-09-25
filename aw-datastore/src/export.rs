@@ -188,6 +188,24 @@ fn write_csv_record(
     writer.write_all(b"\n").map_err(csv_io_err)
 }
 
+/// Maximum number of `data` keys exported as individual CSV columns.
+///
+/// A bucket whose events each carry a distinct key would otherwise emit
+/// `events × keys` cells — quadratic in the event count, and enough to fill the
+/// staging file. Above this cap the export keeps a single `data` column holding
+/// each event's full data object as JSON: bounded, and still lossless.
+const MAX_CSV_DATA_COLUMNS: usize = 32;
+
+/// Resolve the data columns for an export: the union of keys, or a single
+/// `data` JSON column when that union exceeds `MAX_CSV_DATA_COLUMNS`.
+fn csv_data_columns(key_order: Vec<String>) -> (Vec<String>, bool) {
+    if key_order.len() > MAX_CSV_DATA_COLUMNS {
+        (vec!["data".to_string()], true)
+    } else {
+        (key_order, false)
+    }
+}
+
 fn write_csv_header(writer: &mut impl Write, data_keys: &[String]) -> Result<(), DatastoreError> {
     let mut fields = vec![
         "id".to_string(),
@@ -202,54 +220,30 @@ fn write_csv_event(
     writer: &mut impl Write,
     event: &Event,
     data_keys: &[String],
+    data_json_column: bool,
 ) -> Result<(), DatastoreError> {
     let mut fields = vec![
         event.id.map(|i| i.to_string()).unwrap_or_default(),
         event.timestamp.to_rfc3339(),
         duration_csv(&event.duration),
     ];
-    for key in data_keys {
-        fields.push(event_field_value(event, key));
-    }
-    write_csv_record(writer, fields)
-}
-
-/// Write an already-fetched event slice as RFC-4180 CSV.
-///
-/// Unlike `write_events_csv`, this does not need a database connection —
-/// call it from a background thread after fetching events via `get_events`
-/// so the datastore worker is free during the (potentially long) serialization.
-///
-/// Columns: `id`, `timestamp`, `duration`, then the union of data keys across
-/// all events (heterogeneous event data keeps every key's values).
-pub fn write_csv_from_events(
-    events: &[aw_models::Event],
-    mut writer: impl Write,
-) -> Result<(), DatastoreError> {
-    // Union of keys across all events, so a later event's keys are not
-    // silently dropped just because the first event lacked them.
-    let mut key_order: Vec<String> = Vec::new();
-    let mut seen: HashSet<&str> = HashSet::new();
-    for event in events {
-        for key in event.data.keys() {
-            if seen.insert(key.as_str()) {
-                key_order.push(key.clone());
-            }
+    if data_json_column {
+        fields.push(serde_json::Value::Object(event.data.clone()).to_string());
+    } else {
+        for key in data_keys {
+            fields.push(event_field_value(event, key));
         }
     }
-    let data_keys = key_order;
-    write_csv_header(&mut writer, &data_keys)?;
-    for event in events {
-        write_csv_event(&mut writer, event, &data_keys)?;
-    }
-    writer.flush().map_err(csv_io_err)
+    write_csv_record(writer, fields)
 }
 
 /// Stream events for one bucket as RFC-4180 CSV, writing one row at a time.
 ///
 /// Columns: `id`, `timestamp`, `duration`, then the union of data keys across
 /// all matched events, collected in a pre-pass so heterogeneous event data is
-/// not truncated to the first event's schema.
+/// not truncated to the first event's schema. If the union exceeds
+/// `MAX_CSV_DATA_COLUMNS`, a single `data` column holds each event's JSON data
+/// object instead (bounded output, no keys dropped).
 /// Query filters, clipping, and corrupt-row skipping match `get_events`.
 pub(crate) fn write_events_csv(
     conn: &Connection,
@@ -351,7 +345,7 @@ pub(crate) fn write_events_csv(
         })?;
 
     let clip = Some((starttime_filter_ns, endtime_filter_ns));
-    let data_keys = key_order;
+    let (data_keys, data_json_column) = csv_data_columns(key_order);
     write_csv_header(&mut writer, &data_keys)?;
     while let Some(row) = rows.next().map_err(|err| {
         DatastoreError::InternalError(format!("Failed to read CSV export row: {err}"))
@@ -363,7 +357,7 @@ pub(crate) fn write_events_csv(
                 continue;
             }
         };
-        write_csv_event(&mut writer, &event, &data_keys)?;
+        write_csv_event(&mut writer, &event, &data_keys, data_json_column)?;
     }
     writer.flush().map_err(csv_io_err)
 }
@@ -496,31 +490,6 @@ mod tests {
     }
 
     #[test]
-    fn csv_columns_use_union_of_keys_across_events() {
-        let events: Vec<Event> = [
-            serde_json::json!({"a": 1, "b": 2}),
-            serde_json::json!({"a": 3, "c": 4}),
-        ]
-        .into_iter()
-        .map(|data| {
-            Event::new(
-                DateTime::from_timestamp(0, 0).unwrap(),
-                Duration::seconds(1),
-                serde_json::from_value(data).unwrap(),
-            )
-        })
-        .collect();
-        let mut output = Vec::new();
-        write_csv_from_events(&events, &mut output).unwrap();
-        let csv = String::from_utf8(output).unwrap();
-        let header = csv.lines().next().unwrap();
-        assert!(header.contains(",a,"), "header: {header}");
-        assert!(header.ends_with(",b,c"), "header: {header}");
-        // Second event keeps its `c` value instead of losing it.
-        assert!(csv.contains(",4"), "second row lost c: {csv}");
-    }
-
-    #[test]
     fn streamed_csv_columns_use_union_of_keys_across_events() {
         let (conn, mut ds) = setup();
         let events = [
@@ -548,6 +517,35 @@ mod tests {
     }
 
     #[test]
+    fn csv_falls_back_to_a_json_data_column_for_wide_schemas() {
+        let (conn, mut ds) = setup();
+        // One distinct key per event: the union grows with the event count.
+        let events: Vec<Event> = (0..MAX_CSV_DATA_COLUMNS + 1)
+            .map(|i| {
+                let mut data = serde_json::Map::new();
+                data.insert(format!("k{i}"), serde_json::json!(i));
+                Event::new(
+                    DateTime::from_timestamp(i as i64, 0).unwrap(),
+                    Duration::seconds(1),
+                    data,
+                )
+            })
+            .collect();
+        ds.insert_events(&conn, "empty", events).unwrap();
+
+        let mut output = Vec::new();
+        ds.write_events_csv(&conn, "empty", None, None, None, &mut output)
+            .unwrap();
+        let csv = String::from_utf8(output).unwrap();
+        // Bounded header: one `data` column instead of one column per key.
+        assert_eq!(csv.lines().next().unwrap(), "id,timestamp,duration,data");
+        assert_eq!(csv.lines().count(), MAX_CSV_DATA_COLUMNS + 2, "{csv}");
+        // No keys are dropped: every event's data object survives as JSON.
+        assert!(csv.contains("k0"), "first key lost: {csv}");
+        assert!(csv.contains("k32"), "last key lost: {csv}");
+    }
+
+    #[test]
     fn csv_flush_errors_propagate() {
         struct FlushFailingWriter;
         impl Write for FlushFailingWriter {
@@ -561,13 +559,15 @@ mod tests {
                 ))
             }
         }
+        let (conn, mut ds) = setup();
         let event = Event::new(
             DateTime::from_timestamp(0, 0).unwrap(),
             Duration::nanoseconds(1_500_000),
             serde_json::from_value(serde_json::json!({"app": "firefox"})).unwrap(),
         );
+        ds.insert_events(&conn, "empty", vec![event]).unwrap();
         assert!(matches!(
-            write_csv_from_events(&[event], FlushFailingWriter),
+            ds.write_events_csv(&conn, "empty", None, None, None, FlushFailingWriter),
             Err(DatastoreError::InternalError(msg)) if msg.contains("disk full")
         ));
     }

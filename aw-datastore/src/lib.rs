@@ -25,7 +25,7 @@ mod worker;
 
 pub use self::datastore::DatastoreInstance;
 pub use self::datastore::NEWEST_DB_VERSION;
-pub use self::export::write_csv_from_events;
+
 pub use self::worker::Datastore;
 
 #[derive(Clone)]

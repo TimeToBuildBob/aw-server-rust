@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{copy, pipe, BufWriter, Cursor, PipeReader, PipeWriter, Seek, SeekFrom, Write};
+use std::io::{copy, pipe, Cursor, PipeReader, PipeWriter, Seek, SeekFrom};
 use std::thread;
 
 use chrono::{DateTime, Utc};
@@ -171,36 +171,25 @@ fn spawn_csv_export_stream(
     writer: PipeWriter,
 ) {
     thread::spawn(move || {
-        // Fetch events via the worker. The worker holds the DB lock only for
-        // this SQL read, then is immediately free for heartbeats and other
-        // requests while CSV serialization runs here, off-worker.
-        let events = match datastore.get_events(&bucket_id, start, end, limit) {
-            Ok(events) => events,
-            Err(err) => {
-                error!("CSV export stream failed fetching events: {err:?}");
-                return;
-            }
-        };
-        let mut staging = match tempfile::tempfile() {
+        let staging = match tempfile::tempfile() {
             Ok(file) => file,
             Err(err) => {
                 error!("Failed to create CSV staging file: {err}");
                 return;
             }
         };
+        // Serialize on the datastore worker, one SQL row at a time, into the
+        // staging file. The full event set is never materialized in memory,
+        // and a flush failure (e.g. full staging filesystem) surfaces as an
+        // error instead of a silently truncated CSV.
+        let mut staging = match datastore.export_csv_to_file(&bucket_id, start, end, limit, staging)
         {
-            let mut csv_writer = BufWriter::new(&mut staging);
-            if let Err(err) = aw_datastore::write_csv_from_events(&events, &mut csv_writer) {
+            Ok(file) => file,
+            Err(err) => {
                 error!("CSV export serialization failed: {err:?}");
                 return;
             }
-            // BufWriter::drop swallows flush errors. Detect a full staging
-            // filesystem (or similar) before we rewind and copy a truncated CSV.
-            if let Err(err) = csv_writer.flush() {
-                error!("CSV export flush failed: {err}");
-                return;
-            }
-        }
+        };
         if let Err(err) = staging.seek(SeekFrom::Start(0)) {
             error!("CSV staging rewind failed: {err}");
             return;
