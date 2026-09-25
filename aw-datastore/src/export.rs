@@ -156,11 +156,21 @@ fn csv_escape(s: &str) -> String {
 
 /// Exact fractional-second duration, matching the JSON nanosecond contract
 /// without going through `num_milliseconds()` (which truncates sub-ms).
+///
+/// Composed from whole seconds and the signed subsecond remainder rather than
+/// `num_nanoseconds()`, which returns `None` (and would export a silent
+/// `0.000000000`) for magnitudes outside the `i64` nanosecond range.
 fn duration_csv(duration: &chrono::Duration) -> String {
-    let ns = duration.num_nanoseconds().unwrap_or(0);
-    let sign = if ns < 0 { "-" } else { "" };
-    let ns = ns.unsigned_abs();
-    format!("{sign}{}.{:09}", ns / 1_000_000_000, ns % 1_000_000_000)
+    let sign = if *duration < chrono::Duration::zero() {
+        "-"
+    } else {
+        ""
+    };
+    format!(
+        "{sign}{}.{:09}",
+        duration.num_seconds().unsigned_abs(),
+        duration.subsec_nanos().unsigned_abs()
+    )
 }
 
 fn event_field_value(event: &Event, key: &str) -> String {
@@ -290,7 +300,9 @@ pub(crate) fn write_events_csv(
     };
     // First pass: collect the union of data keys across matched rows so the
     // header includes keys the first event may lack. Rows are still streamed
-    // in the second pass; only the (small) key set is held in memory.
+    // in the second pass, and the key set is bounded by
+    // `MAX_CSV_DATA_COLUMNS`: collection stops as soon as the union exceeds
+    // the cap, because the fallback decision is already made at that point.
     let keys_sql = sql.replace("SELECT id, starttime, endtime, data", "SELECT data");
     let mut key_order: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -307,6 +319,7 @@ pub(crate) fn write_events_csv(
         .map_err(|err| {
             DatastoreError::InternalError(format!("Failed to query CSV export key pass: {err}"))
         })?;
+    let mut key_overflow = false;
     while let Some(row) = key_rows.next().map_err(|err| {
         DatastoreError::InternalError(format!("Failed to read CSV export key row: {err}"))
     })? {
@@ -322,9 +335,16 @@ pub(crate) fn write_events_csv(
                 for key in obj.keys() {
                     if seen.insert(key.clone()) {
                         key_order.push(key.clone());
+                        if key_order.len() > MAX_CSV_DATA_COLUMNS {
+                            key_overflow = true;
+                            break;
+                        }
                     }
                 }
             }
+        }
+        if key_overflow {
+            break;
         }
     }
     drop(key_rows);
@@ -543,6 +563,34 @@ mod tests {
         // No keys are dropped: every event's data object survives as JSON.
         assert!(csv.contains("k0"), "first key lost: {csv}");
         assert!(csv.contains("k32"), "last key lost: {csv}");
+    }
+
+    #[test]
+    fn streamed_csv_stops_key_pass_at_the_cap_without_truncating_rows() {
+        let (conn, mut ds) = setup();
+        // Far more distinct keys than the cap: the key pre-pass must stop
+        // collecting once the fallback is decided instead of holding every key.
+        let count = 1_000;
+        let events: Vec<Event> = (0..count)
+            .map(|i| {
+                let mut data = serde_json::Map::new();
+                data.insert(format!("k{i}"), serde_json::json!(i));
+                Event::new(
+                    DateTime::from_timestamp(i as i64, 0).unwrap(),
+                    Duration::seconds(1),
+                    data,
+                )
+            })
+            .collect();
+        ds.insert_events(&conn, "empty", events).unwrap();
+
+        let mut output = Vec::new();
+        ds.write_events_csv(&conn, "empty", None, None, None, &mut output)
+            .unwrap();
+        let csv = String::from_utf8(output).unwrap();
+        assert_eq!(csv.lines().next().unwrap(), "id,timestamp,duration,data");
+        // Leaving the key pre-pass early must not truncate the data pass.
+        assert_eq!(csv.lines().count(), count as usize + 1, "{csv}");
     }
 
     #[test]

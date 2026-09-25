@@ -46,6 +46,22 @@ pub struct BucketsExportRocket {
     filename: String,
 }
 
+/// Make a client-supplied bucket id safe to interpolate into a response header.
+///
+/// Bucket ids are not restricted at creation, and Rocket percent-decodes path
+/// segments, so an id containing CR/LF would otherwise split the
+/// `Content-Disposition` header (response splitting / header injection).
+fn sanitize_header_value(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| match c {
+            c if c.is_control() => '_',
+            '"' | '\\' | ';' => '_',
+            c => c,
+        })
+        .collect()
+}
+
 fn export_filename(
     datastore: &aw_datastore::Datastore,
     bucket_id: Option<&str>,
@@ -61,7 +77,10 @@ fn export_filename(
         }
     };
     Ok(match name {
-        Some(id) => format!("attachment; filename=aw-bucket-export_{id}.json"),
+        Some(id) => format!(
+            "attachment; filename=aw-bucket-export_{}.json",
+            sanitize_header_value(&id)
+        ),
         None => "attachment; filename=aw-buckets-export.json".into(),
     })
 }
@@ -227,7 +246,10 @@ impl BucketEventsCsvRocket {
         // (same tradeoff as JSON export / #721).
         datastore.get_bucket(bucket_id)?;
         datastore.get_events(bucket_id, start, end, Some(1))?;
-        let filename = format!("attachment; filename=aw-events-export-{bucket_id}.csv");
+        let filename = format!(
+            "attachment; filename=aw-events-export-{}.csv",
+            sanitize_header_value(bucket_id)
+        );
         Ok(Self {
             datastore: datastore.clone(),
             bucket_id: bucket_id.to_owned(),
@@ -297,5 +319,25 @@ impl From<DatastoreError> for HttpErrorJson {
                 HttpErrorJson::new(Status::InternalServerError, msg)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_header_value;
+
+    #[test]
+    fn sanitize_header_value_strips_header_metacharacters() {
+        assert_eq!(
+            sanitize_header_value("aw-watcher-window_host"),
+            "aw-watcher-window_host"
+        );
+        // CR/LF would split the header; quote/backslash/semicolon would end or
+        // re-parameterize the filename value.
+        assert_eq!(
+            sanitize_header_value("evil\r\nX-Injected: 1"),
+            "evil__X-Injected: 1"
+        );
+        assert_eq!(sanitize_header_value("a\"b\\c;d"), "a_b_c_d");
     }
 }
