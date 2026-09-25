@@ -1,4 +1,5 @@
-use std::{collections::HashMap, io::Write};
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
 
 use aw_models::{Bucket, Event};
 use chrono::{DateTime, Utc};
@@ -129,9 +130,16 @@ fn csv_io_err(err: std::io::Error) -> DatastoreError {
 }
 
 /// Prefix spreadsheet-formula starters so Excel/Sheets will not execute them.
+/// Characters spreadsheets ignore before evaluating a formula starter
+/// (Excel and LibreOffice trim leading whitespace, so " =1+1" executes).
+const FORMULA_LEADING_WHITESPACE: [char; 4] = [' ', '\t', '\r', '\n'];
+
+/// Prefix spreadsheet-formula starters so Excel/Sheets will not execute them.
+/// Looks past leading whitespace so values like " =1+1" are neutralized too.
 fn neutralize_formula(s: &str) -> String {
-    match s.chars().next() {
-        Some('=' | '+' | '-' | '@' | '\t' | '\r') => format!("'{s}"),
+    let trimmed = s.trim_start_matches(FORMULA_LEADING_WHITESPACE);
+    match trimmed.chars().next() {
+        Some('=' | '+' | '-' | '@') => format!("'{s}"),
         _ => s.to_owned(),
     }
 }
@@ -212,16 +220,24 @@ fn write_csv_event(
 /// call it from a background thread after fetching events via `get_events`
 /// so the datastore worker is free during the (potentially long) serialization.
 ///
-/// Columns: `id`, `timestamp`, `duration`, then all keys from the first
-/// event's data map.
+/// Columns: `id`, `timestamp`, `duration`, then the union of data keys across
+/// all events (heterogeneous event data keeps every key's values).
 pub fn write_csv_from_events(
     events: &[aw_models::Event],
     mut writer: impl Write,
 ) -> Result<(), DatastoreError> {
-    let data_keys: Vec<String> = events
-        .first()
-        .map(|e| e.data.keys().cloned().collect())
-        .unwrap_or_default();
+    // Union of keys across all events, so a later event's keys are not
+    // silently dropped just because the first event lacked them.
+    let mut key_order: Vec<String> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for event in events {
+        for key in event.data.keys() {
+            if seen.insert(key.as_str()) {
+                key_order.push(key.clone());
+            }
+        }
+    }
+    let data_keys = key_order;
     write_csv_header(&mut writer, &data_keys)?;
     for event in events {
         write_csv_event(&mut writer, event, &data_keys)?;
@@ -231,8 +247,9 @@ pub fn write_csv_from_events(
 
 /// Stream events for one bucket as RFC-4180 CSV, writing one row at a time.
 ///
-/// Columns: `id`, `timestamp`, `duration`, then all keys from the first
-/// valid event's `data` map (same schema the webui uses for client-side CSV).
+/// Columns: `id`, `timestamp`, `duration`, then the union of data keys across
+/// all matched events, collected in a pre-pass so heterogeneous event data is
+/// not truncated to the first event's schema.
 /// Query filters, clipping, and corrupt-row skipping match `get_events`.
 pub(crate) fn write_events_csv(
     conn: &Connection,
@@ -277,6 +294,48 @@ pub(crate) fn write_events_csv(
              WHERE bucketrow = ?1 AND endtime >= ?2 AND starttime <= ?3
              ORDER BY starttime DESC, endtime ASC, id ASC LIMIT ?4"
     };
+    // First pass: collect the union of data keys across matched rows so the
+    // header includes keys the first event may lack. Rows are still streamed
+    // in the second pass; only the (small) key set is held in memory.
+    let keys_sql = sql.replace("SELECT id, starttime, endtime, data", "SELECT data");
+    let mut key_order: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut keys_stmt = conn.prepare_cached(&keys_sql).map_err(|err| {
+        DatastoreError::InternalError(format!("Failed to prepare CSV export key pass: {err}"))
+    })?;
+    let mut key_rows = keys_stmt
+        .query(rusqlite::params![
+            bucket.bid.unwrap(),
+            starttime_filter_ns,
+            endtime_filter_ns,
+            limit,
+        ])
+        .map_err(|err| {
+            DatastoreError::InternalError(format!("Failed to query CSV export key pass: {err}"))
+        })?;
+    while let Some(row) = key_rows.next().map_err(|err| {
+        DatastoreError::InternalError(format!("Failed to read CSV export key row: {err}"))
+    })? {
+        let data: Option<String> = row.get(0).map_err(|err| {
+            DatastoreError::InternalError(format!("Failed to read CSV export key data: {err}"))
+        })?;
+        let data = match data {
+            Some(d) => d,
+            None => continue,
+        };
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&data) {
+            if let Some(obj) = value.as_object() {
+                for key in obj.keys() {
+                    if seen.insert(key.clone()) {
+                        key_order.push(key.clone());
+                    }
+                }
+            }
+        }
+    }
+    drop(key_rows);
+    drop(keys_stmt);
+
     let mut stmt = conn.prepare_cached(sql).map_err(|err| {
         DatastoreError::InternalError(format!("Failed to prepare CSV export SQL: {err}"))
     })?;
@@ -292,7 +351,8 @@ pub(crate) fn write_events_csv(
         })?;
 
     let clip = Some((starttime_filter_ns, endtime_filter_ns));
-    let mut data_keys: Option<Vec<String>> = None;
+    let data_keys = key_order;
+    write_csv_header(&mut writer, &data_keys)?;
     while let Some(row) = rows.next().map_err(|err| {
         DatastoreError::InternalError(format!("Failed to read CSV export row: {err}"))
     })? {
@@ -303,15 +363,7 @@ pub(crate) fn write_events_csv(
                 continue;
             }
         };
-        if data_keys.is_none() {
-            let keys: Vec<String> = event.data.keys().cloned().collect();
-            write_csv_header(&mut writer, &keys)?;
-            data_keys = Some(keys);
-        }
-        write_csv_event(&mut writer, &event, data_keys.as_ref().unwrap())?;
-    }
-    if data_keys.is_none() {
-        write_csv_header(&mut writer, &[])?;
+        write_csv_event(&mut writer, &event, &data_keys)?;
     }
     writer.flush().map_err(csv_io_err)
 }
@@ -434,6 +486,65 @@ mod tests {
             "\"A \"\"quoted\"\" title\""
         );
         assert_eq!(csv_escape("=1,2"), "\"'=1,2\"");
+    }
+
+    #[test]
+    fn csv_escape_neutralizes_whitespace_prefixed_formulas() {
+        assert_eq!(csv_escape(" =1+1"), "' =1+1");
+        assert_eq!(csv_escape("\t+cmd"), "'\t+cmd");
+        assert_eq!(csv_escape(" plain"), " plain");
+    }
+
+    #[test]
+    fn csv_columns_use_union_of_keys_across_events() {
+        let events: Vec<Event> = [
+            serde_json::json!({"a": 1, "b": 2}),
+            serde_json::json!({"a": 3, "c": 4}),
+        ]
+        .into_iter()
+        .map(|data| {
+            Event::new(
+                DateTime::from_timestamp(0, 0).unwrap(),
+                Duration::seconds(1),
+                serde_json::from_value(data).unwrap(),
+            )
+        })
+        .collect();
+        let mut output = Vec::new();
+        write_csv_from_events(&events, &mut output).unwrap();
+        let csv = String::from_utf8(output).unwrap();
+        let header = csv.lines().next().unwrap();
+        assert!(header.contains(",a,"), "header: {header}");
+        assert!(header.ends_with(",b,c"), "header: {header}");
+        // Second event keeps its `c` value instead of losing it.
+        assert!(csv.contains(",4"), "second row lost c: {csv}");
+    }
+
+    #[test]
+    fn streamed_csv_columns_use_union_of_keys_across_events() {
+        let (conn, mut ds) = setup();
+        let events = [
+            serde_json::json!({"app": "firefox", "title": "t"}),
+            serde_json::json!({"app": "firefox", "url": "u"}),
+        ]
+        .into_iter()
+        .map(|data| {
+            Event::new(
+                DateTime::from_timestamp(0, 0).unwrap(),
+                Duration::seconds(1),
+                serde_json::from_value(data).unwrap(),
+            )
+        })
+        .collect();
+        ds.insert_events(&conn, "empty", events).unwrap();
+
+        let mut output = Vec::new();
+        ds.write_events_csv(&conn, "empty", None, None, None, &mut output)
+            .unwrap();
+        let csv = String::from_utf8(output).unwrap();
+        let header = csv.lines().next().unwrap();
+        assert!(header.ends_with(",app,title,url"), "header: {header}");
+        assert!(csv.contains(",u"), "second row lost url: {csv}");
     }
 
     #[test]
