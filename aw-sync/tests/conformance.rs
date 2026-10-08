@@ -87,6 +87,11 @@ enum Op {
     Delete {
         idx: u8,
     },
+    /// Insert a second, distinct event at the previous event's timestamp
+    /// (two watchers can legitimately emit at the same instant).
+    InsertSameTs {
+        title: u8,
+    },
     /// Push source → export, then pull export → destination.
     Sync,
 }
@@ -97,6 +102,7 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         2 => (1u8..120).prop_map(|extend_secs| Op::Heartbeat { extend_secs }),
         2 => (0u8..8, 0u8..4).prop_map(|(idx, title)| Op::Edit { idx, title }),
         1 => (0u8..8).prop_map(|idx| Op::Delete { idx }),
+        1 => (0u8..4).prop_map(|title| Op::InsertSameTs { title }),
         3 => Just(Op::Sync),
     ]
 }
@@ -176,6 +182,16 @@ impl World {
                 }
                 let id = events[*idx as usize % events.len()].id.unwrap();
                 self.src.delete_events_by_id(SRC_BUCKET, vec![id]).unwrap();
+            }
+            Op::InsertSameTs { title } => {
+                if let Some(last) = self.source_events().last().cloned() {
+                    self.src
+                        .insert_events(
+                            SRC_BUCKET,
+                            &[event(last.timestamp, 3, &format!("s{title}"))],
+                        )
+                        .unwrap();
+                }
             }
             Op::Sync => self.sync(),
         }
@@ -266,11 +282,11 @@ fn seed_793_backfill_behind_cursor_is_recovered() {
     w.check().unwrap();
 }
 
-/// ActivityWatch/aw-server-rust#798: an edit that keeps the timestamp but
-/// changes the data must replace the stale destination row by tuple identity,
-/// not leave both copies.
+/// ActivityWatch/aw-server-rust#798: a second source event at the same
+/// timestamp with different data must not get the earlier destination copy
+/// deleted as "stale"; identity is the (timestamp, duration, data) tuple.
 #[test]
-fn seed_798_edit_replaces_stale_row_by_tuple_identity() {
+fn seed_798_same_timestamp_distinct_event_is_not_stale() {
     let ops = [
         Op::Insert {
             gap: 5,
@@ -278,7 +294,23 @@ fn seed_798_edit_replaces_stale_row_by_tuple_identity() {
             title: 0,
         },
         Op::Sync,
-        Op::Edit { idx: 0, title: 3 },
+        Op::InsertSameTs { title: 1 },
+    ];
+    run(&ops).unwrap();
+}
+
+/// Shrunk by proptest on master (session 1e11): editing a duration-0 event
+/// after it was synced leaves the pre-edit row in the destination.
+#[test]
+fn seed_shrunk_zero_duration_edit_leaves_stale_row() {
+    let ops = [
+        Op::Insert {
+            gap: 1,
+            secs: 0,
+            title: 0,
+        },
+        Op::Sync,
+        Op::Edit { idx: 0, title: 0 },
     ];
     run(&ops).unwrap();
 }

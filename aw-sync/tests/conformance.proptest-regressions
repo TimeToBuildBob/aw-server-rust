@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 0e3c1ce9bb632d20fcfe42ef03052719015009cc40fad96ec931d512f9c113f2 # shrinks to ops = [Insert { gap: 1, secs: 0, title: 0 }, Sync, Edit { idx: 0, title: 0 }]
+cc 9f69ddc8e9057bca3cc64eb30768e03ea7777f272d70bf6bfcbf54c5033f58a0 # shrinks to ops = [Insert { gap: 1, secs: 0, title: 0 }, Sync, Edit { idx: 0, title: 0 }]
