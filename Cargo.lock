@@ -321,6 +321,7 @@ dependencies = [
  "jni 0.21.1",
  "log",
  "openssl",
+ "proptest",
  "reqwest",
  "rusqlite",
  "serde",
