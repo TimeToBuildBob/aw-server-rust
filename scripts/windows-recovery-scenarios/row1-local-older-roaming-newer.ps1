@@ -56,6 +56,19 @@ function Add-FixtureEvents {
         -Body (ConvertTo-Json -Compress -Depth 5 -InputObject $events) | Out-Null
 }
 
+function Wait-FixtureCommitted {
+    # aw-datastore's worker batches inserts and commits after a 15 s interval
+    # (worker.rs); killing earlier loses the events, not just leaves them in the
+    # WAL. Wait past the interval, then require a non-empty WAL as evidence of
+    # committed-but-uncheckpointed state.
+    param([string]$Dir, [string]$Name)
+    Start-Sleep -Seconds 20
+    $wal = Join-Path $Dir 'sqlite.db-wal'
+    $len = if (Test-Path -LiteralPath $wal) { (Get-Item -LiteralPath $wal).Length } else { 0 }
+    $scenario["wal_bytes_$Name"] = $len
+    Assert-True ($len -gt 0) "$Name fixture has no committed WAL content to recover from"
+}
+
 function Get-FixtureSentinels {
     param([int]$Port)
     $events = @(Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/0/buckets/$bucketId/events?limit=1000" -TimeoutSec 15)
@@ -72,6 +85,7 @@ try {
     # 1. Local history (older): the isolation proof's default-profile server
     #    already created the Local datastore. Write through it, then kill it.
     Add-FixtureEvents -Port $port -Tag 'LOCAL' -Day '2026-01-01'
+    Wait-FixtureCommitted -Dir $localApp -Name 'local'
     & taskkill.exe /PID $serverProcess.Id /T /F 2>$null | Out-Null
     $null = $serverProcess.WaitForExit(15000)
     $scenario['local_dir_after_fixture'] = @(Get-ChildItem -LiteralPath $localApp -Name -ErrorAction SilentlyContinue)
@@ -81,6 +95,7 @@ try {
     $roamPort = $port + 1
     $server = Start-ScenarioServer -Name 'roam-fixture' -Port $roamPort -ExtraArgs ('--dbpath "{0}"' -f (Join-Path $roamApp 'sqlite.db'))
     Add-FixtureEvents -Port $roamPort -Tag 'ROAM' -Day '2026-06-01'
+    Wait-FixtureCommitted -Dir $roamApp -Name 'roaming'
     Stop-ScenarioServer $server
     $server = $null
     Assert-True (Test-Path -LiteralPath (Join-Path $roamApp 'sqlite.db')) 'Roaming fixture database was not created'
