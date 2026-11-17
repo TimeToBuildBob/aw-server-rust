@@ -1,0 +1,51 @@
+# THROWAWAY (fork only, never for merge): run the Windows recovery matrix rows
+# against the PUBLISHED v0.14.2 standalone aw-server-rust.exe instead of a debug
+# CI build. ActivityWatch/activitywatch#1515 packaged-artifact verification.
+name: Packaged v0.14.2 recovery matrix
+on:
+  push:
+    branches: [ci/packaged-v0142-recovery]
+jobs:
+  packaged:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Download published v0.14.2 standalone zip
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        gh release download v0.14.2 --repo ActivityWatch/activitywatch --pattern 'activitywatch-v0.14.2-windows-x86_64.zip' --dir "$env:RUNNER_TEMP"
+        $zip = Join-Path $env:RUNNER_TEMP 'activitywatch-v0.14.2-windows-x86_64.zip'
+        "zip sha256: $((Get-FileHash $zip -Algorithm SHA256).Hash)"
+        Expand-Archive $zip -DestinationPath "$env:RUNNER_TEMP\aw"
+        $exe = Get-ChildItem "$env:RUNNER_TEMP\aw" -Recurse -Filter 'aw-server-rust.exe' | Select-Object -First 1
+        if (-not $exe) { Get-ChildItem "$env:RUNNER_TEMP\aw" -Recurse -Filter '*.exe' | ForEach-Object FullName; throw 'aw-server-rust.exe not found' }
+        "exe: $($exe.FullName)"
+        "exe sha256: $((Get-FileHash $exe.FullName -Algorithm SHA256).Hash)"
+        "exe ProductVersion: $($exe.VersionInfo.ProductVersion) FileVersion: $($exe.VersionInfo.FileVersion)"
+        & $exe.FullName --version
+        "AW_EXE=$($exe.FullName)" | Out-File -Append $env:GITHUB_ENV
+    - name: Guards
+      shell: pwsh
+      run: |
+        ./scripts/test-windows-disposable-profile-guards.ps1
+        ./scripts/test-windows-recovery-guards.ps1
+    - name: Row 1 (Local older, Roaming newer) on packaged exe
+      shell: pwsh
+      run: ./scripts/test-windows-disposable-profile.ps1 -ServerExe "$env:AW_EXE" -User awrow1 -EvidencePath "$env:RUNNER_TEMP/packaged-row1-evidence.json" -ScenarioPath scripts/windows-recovery-scenarios/row1-local-older-roaming-newer.ps1
+    - name: Row 2 (stale Local testing, newer Roaming) on packaged exe
+      if: ${{ !cancelled() }}
+      shell: pwsh
+      run: ./scripts/test-windows-disposable-profile.ps1 -ServerExe "$env:AW_EXE" -User awrow2 -EvidencePath "$env:RUNNER_TEMP/packaged-row2-evidence.json" -ScenarioPath scripts/windows-recovery-scenarios/row2-stale-local-testing-newer-roaming.ps1
+    - name: Row 3 (Roaming, missed Python history) on packaged exe
+      if: ${{ !cancelled() }}
+      shell: pwsh
+      run: ./scripts/test-windows-disposable-profile.ps1 -ServerExe "$env:AW_EXE" -User awrow3 -EvidencePath "$env:RUNNER_TEMP/packaged-row3-evidence.json" -ScenarioPath scripts/windows-recovery-scenarios/row3-roaming-with-missed-python-history.ps1
+    - name: Retain evidence
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: packaged-v0142-recovery-evidence
+        path: ${{ runner.temp }}/packaged-row*-evidence.json
+        if-no-files-found: warn
